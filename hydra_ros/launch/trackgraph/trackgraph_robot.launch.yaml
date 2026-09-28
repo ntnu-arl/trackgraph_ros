@@ -1,0 +1,63 @@
+---
+launch:
+  # CAMERA AND TF CONFIGURATION: edit these defaults for your robot, or pass
+  # rgb_topic:=... etc. on the command line. Use the same RGB/depth topics in
+  # instance_tracking_ros/launch/robot.launch.yaml. Depth must be registered
+  # to RGB with matching resolution and intrinsics; sensor_frame is optical.
+  - arg: {name: rgb_topic, default: /camera/camera/color/image_raw}
+  - arg: {name: depth_topic, default: /camera/camera/aligned_depth_to_color/image_raw}
+  - arg: {name: camera_info_topic, default: /camera/camera/color/camera_info}
+  - arg: {name: tracking_namespace, default: /front_camera/tracking}
+  - arg: {name: robot_frame, default: base_link}
+  - arg: {name: odom_frame, default: odom}
+  - arg: {name: map_frame, default: map}
+  - arg: {name: sensor_frame, default: camera_color_optical_frame}
+  - arg: {name: use_sim_time, default: 'false'}
+  - arg: {name: start_visualizer, default: 'true'}
+  - arg: {name: log_name, default: robot}
+  - arg: {name: log_path, default: $(env HOME)/.hydra/$(var log_name)}
+  - arg: {name: exit_after_clock, default: 'false'}
+  - arg:
+      name: open_vocab_encoder_id
+      default: 'openclip:ViT-B-16:openai:precision=fp16'
+
+  # TrackGraph configuration. Algorithm and sensor-range settings belong in the
+  # two robot YAML presets, not in this launch file.
+  - let: {name: trackgraph_common_config, value: $(find-pkg-share hydra)/config/trackgraph_config/trackgraph_common_config.yaml}
+  - let: {name: hydra_robot_config, value: $(find-pkg-share hydra)/config/trackgraph_config/robot.yaml}
+  - let: {name: input_robot_config, value: $(find-pkg-share hydra_ros)/config/trackgraph_config/robot.yaml}
+  - let: {name: visualizer_config_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_config_tracked.yaml}
+  - let: {name: visualizer_plugins_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_plugins_tracked.yaml}
+  - let: {name: rviz_tracked, value: $(find-pkg-share hydra_visualizer)/rviz/tracked_streaming_visualizer.rviz}
+
+  # Preserve `left_cam` as Hydra's internal sensor name.
+  - set_remap: {from: hydra/input/left_cam/rgb/image_raw, to: $(var rgb_topic)}
+  - set_remap: {from: hydra/input/left_cam/depth_registered/image_rect, to: $(var depth_topic)}
+  - set_remap: {from: hydra/input/left_cam/rgb/camera_info, to: $(var camera_info_topic)}
+  - set_remap: {from: hydra/input/left_cam/tracking/instances, to: $(var tracking_namespace)/instances}
+  - set_remap: {from: hydra/input/tracking/open_vocab_features, to: $(var tracking_namespace)/open_vocab_features}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_text, to: $(var tracking_namespace)/open_vocab/encode_text}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_image, to: $(var tracking_namespace)/open_vocab/encode_image}
+
+  - include:
+      file: $(find-pkg-share hydra_ros)/launch/hydra.launch.yaml
+      arg:
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: dataset, value: robot}
+        - {name: labelspace, value: ade20k_full}
+        - {name: log_name, value: $(var log_name)}
+        - {name: log_path, value: $(var log_path)}
+        - {name: exit_after_clock, value: $(var exit_after_clock)}
+        - name: extra_yaml_runtime
+          value: '{input: {inputs: {left_cam: {sensor: {extrinsics: {sensor_frame: $(var sensor_frame)}}}}}, frontend: {tracked_objects: {open_vocab: {expected_encoder_id: $(var open_vocab_encoder_id)}}}}'
+        - {name: hydra_config_path, value: $(var trackgraph_common_config)}
+        - {name: hydra_overlay_config_path, value: $(var hydra_robot_config)}
+        - {name: input_config_path, value: $(var input_robot_config)}
+        - {name: visualizer_config_path, value: $(var visualizer_config_tracked)}
+        - {name: visualizer_plugins_path, value: $(var visualizer_plugins_tracked)}
+        - {name: rviz_path, value: $(var rviz_tracked)}
+        - {name: start_visualizer, value: $(var start_visualizer)}
+        - {name: sensor_frame, value: $(var sensor_frame)}
+        - {name: robot_frame, value: $(var robot_frame)}
+        - {name: odom_frame, value: $(var odom_frame)}
+        - {name: map_frame, value: $(var map_frame)}

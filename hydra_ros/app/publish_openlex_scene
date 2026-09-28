@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""Publish OpenLex3D RGB-D scene inputs as ROS2 topics."""
+
+import json
+import math
+import pathlib
+import sys
+import zlib
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import lz4.block
+import numpy as np
+import rclpy
+import rclpy.utilities
+from geometry_msgs.msg import TransformStamped
+from rcl_interfaces.msg import SetParametersResult
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+
+
+SCAN_DEPTH_HEIGHT = 192
+SCAN_DEPTH_WIDTH = 256
+CAMERA_CONVENTION_FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
+
+
+def _resolve_scene_root(dataset_root: pathlib.Path, dataset: str, scene_name: str) -> pathlib.Path:
+    root = dataset_root.expanduser()
+    candidates: List[pathlib.Path] = []
+    if dataset == "scannetpp":
+        candidates = [
+            root / "data" / scene_name,
+            root / scene_name,
+        ]
+    elif dataset == "hm3d":
+        candidates = [
+            root / scene_name,
+        ]
+    else:
+        raise ValueError(f"unsupported OpenLex dataset: {dataset}")
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    raise ValueError(
+        f"scene '{scene_name}' for dataset '{dataset}' was not found under {dataset_root}"
+    )
+
+
+def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * scale
+        qx = (rotation[2, 1] - rotation[1, 2]) / scale
+        qy = (rotation[0, 2] - rotation[2, 0]) / scale
+        qz = (rotation[1, 0] - rotation[0, 1]) / scale
+    elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
+        scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+        qw = (rotation[2, 1] - rotation[1, 2]) / scale
+        qx = 0.25 * scale
+        qy = (rotation[0, 1] + rotation[1, 0]) / scale
+        qz = (rotation[0, 2] + rotation[2, 0]) / scale
+    elif rotation[1, 1] > rotation[2, 2]:
+        scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+        qw = (rotation[0, 2] - rotation[2, 0]) / scale
+        qx = (rotation[0, 1] + rotation[1, 0]) / scale
+        qy = 0.25 * scale
+        qz = (rotation[1, 2] + rotation[2, 1]) / scale
+    else:
+        scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+        qw = (rotation[1, 0] - rotation[0, 1]) / scale
+        qx = (rotation[0, 2] + rotation[2, 0]) / scale
+        qy = (rotation[1, 2] + rotation[2, 1]) / scale
+        qz = 0.25 * scale
+
+    quat = np.array([qw, qx, qy, qz], dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm == 0.0:
+        raise ValueError("invalid rotation matrix produced a zero quaternion")
+    return quat / norm
+
+
+def _make_image_msg(stamp, frame_id: str, image: np.ndarray, encoding: str) -> Image:
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = int(image.shape[0])
+    msg.width = int(image.shape[1])
+    msg.encoding = encoding
+    msg.is_bigendian = False
+    msg.step = int(image.strides[0])
+    msg.data = image.tobytes()
+    return msg
+
+
+def _make_camera_info(
+    stamp,
+    frame_id: str,
+    width: int,
+    height: int,
+    intrinsic: np.ndarray,
+) -> CameraInfo:
+    info = CameraInfo()
+    info.header.stamp = stamp
+    info.header.frame_id = frame_id
+    info.width = int(width)
+    info.height = int(height)
+    info.distortion_model = "plumb_bob"
+    info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+    info.k = [
+        float(intrinsic[0, 0]),
+        float(intrinsic[0, 1]),
+        float(intrinsic[0, 2]),
+        float(intrinsic[1, 0]),
+        float(intrinsic[1, 1]),
+        float(intrinsic[1, 2]),
+        float(intrinsic[2, 0]),
+        float(intrinsic[2, 1]),
+        float(intrinsic[2, 2]),
+    ]
+    info.r = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    info.p = [
+        float(intrinsic[0, 0]),
+        float(intrinsic[0, 1]),
+        float(intrinsic[0, 2]),
+        0.0,
+        float(intrinsic[1, 0]),
+        float(intrinsic[1, 1]),
+        float(intrinsic[1, 2]),
+        0.0,
+        float(intrinsic[2, 0]),
+        float(intrinsic[2, 1]),
+        float(intrinsic[2, 2]),
+        0.0,
+    ]
+    return info
+
+
+class SceneFrameSource:
+    dataset_name = "openlex"
+
+    @property
+    def frame_count(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def native_width(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def native_height(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def native_fps(self) -> Optional[float]:
+        return None
+
+    def timestamp_ns(self, frame_index: int, fallback_fps: float) -> int:
+        fps = self.native_fps or fallback_fps
+        if fps <= 0.0:
+            raise ValueError("source timestamp FPS must be greater than zero")
+        return int(round(frame_index * 1.0e9 / fps))
+
+    def load_frame(self, frame_index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class HM3DWalkFrameSource(SceneFrameSource):
+    dataset_name = "hm3d"
+
+    def __init__(self, scene_root: pathlib.Path):
+        self._scene_root = scene_root
+        self._rgb_paths = sorted((scene_root / "rgb").glob("*.png"))
+        self._depth_paths = sorted((scene_root / "depth").glob("*.png"))
+        self._pose_paths = sorted((scene_root / "pose").glob("*.txt"))
+        if not self._rgb_paths:
+            raise ValueError(f"no HM3D RGB frames found under {scene_root / 'rgb'}")
+        if len(self._rgb_paths) != len(self._depth_paths) or len(self._rgb_paths) != len(self._pose_paths):
+            raise ValueError(
+                f"mismatched HM3D frame counts: {len(self._rgb_paths)} RGB, "
+                f"{len(self._depth_paths)} depth, {len(self._pose_paths)} poses"
+            )
+
+        first = cv2.imread(str(self._rgb_paths[0]), cv2.IMREAD_COLOR)
+        if first is None:
+            raise ValueError(f"failed to read first HM3D RGB frame: {self._rgb_paths[0]}")
+        self._height, self._width = first.shape[:2]
+        self._intrinsic = self._make_intrinsic(self._height, self._width)
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._rgb_paths)
+
+    @property
+    def native_width(self) -> int:
+        return self._width
+
+    @property
+    def native_height(self) -> int:
+        return self._height
+
+    @property
+    def native_fps(self) -> Optional[float]:
+        return 10.0
+
+    @staticmethod
+    def _make_intrinsic(height: int, width: int) -> np.ndarray:
+        hfov = math.radians(90.0)
+        vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * height / width)
+        fx = width / (2.0 * math.tan(hfov / 2.0))
+        fy = height / (2.0 * math.tan(vfov / 2.0))
+        cx = width / 2.0
+        cy = height / 2.0
+        return np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+
+    @staticmethod
+    def _load_pose(path: pathlib.Path) -> np.ndarray:
+        values = [float(value) for value in path.read_text(encoding="utf-8").split()]
+        if len(values) != 16:
+            raise ValueError(f"invalid HM3D pose file {path}: expected 16 values")
+        pose = np.array(values, dtype=np.float64).reshape(4, 4)
+        return pose @ CAMERA_CONVENTION_FLIP_YZ
+
+    def load_frame(self, frame_index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        color_bgr = cv2.imread(str(self._rgb_paths[frame_index]), cv2.IMREAD_COLOR)
+        if color_bgr is None:
+            raise RuntimeError(f"failed to load HM3D RGB frame: {self._rgb_paths[frame_index]}")
+        depth_raw = cv2.imread(str(self._depth_paths[frame_index]), cv2.IMREAD_UNCHANGED)
+        if depth_raw is None:
+            raise RuntimeError(f"failed to load HM3D depth frame: {self._depth_paths[frame_index]}")
+        color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        depth_m = depth_raw.astype(np.float32) * 1.0e-3
+        pose = self._load_pose(self._pose_paths[frame_index])
+        return color_rgb, depth_m, pose, self._intrinsic.copy()
+
+
+class ScannetppIPhoneFrameSource(SceneFrameSource):
+    dataset_name = "scannetpp"
+
+    def __init__(self, scene_root: pathlib.Path, use_aligned_pose: bool = True):
+        self._scene_root = scene_root
+        iphone_root = scene_root / "iphone"
+        video_path = iphone_root / "rgb.mkv"
+        depth_path = iphone_root / "depth.bin"
+        pose_path = iphone_root / "pose_intrinsic_imu.json"
+        if not video_path.is_file():
+            raise ValueError(f"missing ScanNet++ iPhone RGB video: {video_path}")
+        if not depth_path.is_file():
+            raise ValueError(f"missing ScanNet++ iPhone depth stream: {depth_path}")
+        if not pose_path.is_file():
+            raise ValueError(f"missing ScanNet++ iPhone pose file: {pose_path}")
+
+        self._video = cv2.VideoCapture(str(video_path))
+        if not self._video.isOpened():
+            raise ValueError(f"failed to open ScanNet++ video: {video_path}")
+
+        self._width = int(self._video.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self._video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._fps = float(self._video.get(cv2.CAP_PROP_FPS))
+        if self._fps <= 0.0 or not math.isfinite(self._fps):
+            self._fps = 60.0
+        self._video_frame_count = int(self._video.get(cv2.CAP_PROP_FRAME_COUNT))
+        if self._width <= 0 or self._height <= 0:
+            raise ValueError(f"invalid ScanNet++ video dimensions for {video_path}")
+
+        self._depth_path = depth_path
+        self._depth_offsets = self._index_depth_stream(depth_path)
+        self._metadata = self._load_metadata(pose_path)
+        self._use_aligned_pose = use_aligned_pose
+        self._frame_count = min(
+            self._video_frame_count,
+            len(self._depth_offsets),
+            len(self._metadata),
+        )
+        if self._frame_count == 0:
+            raise ValueError(f"ScanNet++ scene has no synchronized iPhone frames: {scene_root}")
+
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    @property
+    def native_width(self) -> int:
+        return self._width
+
+    @property
+    def native_height(self) -> int:
+        return self._height
+
+    @property
+    def native_fps(self) -> Optional[float]:
+        return self._fps
+
+    @staticmethod
+    def _frame_key(frame_index: int) -> str:
+        return f"frame_{frame_index:06d}"
+
+    @staticmethod
+    def _load_metadata(path: pathlib.Path) -> Dict[str, dict]:
+        with path.open("r", encoding="utf-8") as fin:
+            payload = json.load(fin)
+        if not isinstance(payload, dict):
+            raise ValueError(f"unexpected ScanNet++ pose metadata format: {path}")
+        return payload
+
+    @staticmethod
+    def _index_depth_stream(path: pathlib.Path) -> List[Tuple[int, int]]:
+        offsets: List[Tuple[int, int]] = []
+        with path.open("rb") as fin:
+            while True:
+                size_bytes = fin.read(4)
+                if not size_bytes:
+                    break
+                if len(size_bytes) != 4:
+                    raise ValueError(f"truncated ScanNet++ depth frame size in {path}")
+                size = int.from_bytes(size_bytes, byteorder="little")
+                offset = fin.tell()
+                offsets.append((offset, size))
+                fin.seek(size, 1)
+        return offsets
+
+    def _decode_depth_frame(self, frame_index: int) -> np.ndarray:
+        offset, size = self._depth_offsets[frame_index]
+        with self._depth_path.open("rb") as fin:
+            fin.seek(offset)
+            compressed = fin.read(size)
+        if len(compressed) != size:
+            raise RuntimeError(f"failed to read ScanNet++ depth frame {frame_index}")
+
+        try:
+            data = lz4.block.decompress(
+                compressed,
+                uncompressed_size=SCAN_DEPTH_HEIGHT * SCAN_DEPTH_WIDTH * 2,
+            )
+            depth_mm = np.frombuffer(data, dtype=np.uint16).reshape(
+                SCAN_DEPTH_HEIGHT, SCAN_DEPTH_WIDTH
+            )
+        except Exception:
+            data = zlib.decompress(compressed, wbits=-zlib.MAX_WBITS)
+            depth_m = np.frombuffer(data, dtype=np.float32).reshape(
+                SCAN_DEPTH_HEIGHT, SCAN_DEPTH_WIDTH
+            )
+            depth_mm = (depth_m * 1000.0).astype(np.uint16)
+
+        return depth_mm.astype(np.float32) * 1.0e-3
+
+    def _load_color_frame(self, frame_index: int) -> np.ndarray:
+        self._video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, color_bgr = self._video.read()
+        if not ok or color_bgr is None:
+            raise RuntimeError(f"failed to read ScanNet++ RGB frame {frame_index}")
+        return cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+
+    def _metadata_for_frame(self, frame_index: int) -> dict:
+        key = self._frame_key(frame_index)
+        if key not in self._metadata:
+            raise RuntimeError(f"missing ScanNet++ pose metadata for {key}")
+        return self._metadata[key]
+
+    def load_frame(self, frame_index: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        metadata = self._metadata_for_frame(frame_index)
+        pose_key = "aligned_pose" if self._use_aligned_pose and "aligned_pose" in metadata else "pose"
+        pose = np.asarray(metadata[pose_key], dtype=np.float64).reshape(4, 4)
+        intrinsic = np.asarray(metadata["intrinsic"], dtype=np.float64).reshape(3, 3)
+        color_rgb = self._load_color_frame(frame_index)
+        depth_m = self._decode_depth_frame(frame_index)
+        return color_rgb, depth_m, pose, intrinsic
+
+    def close(self) -> None:
+        self._video.release()
+
+
+def _scale_intrinsic(
+    intrinsic: np.ndarray,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> np.ndarray:
+    scaled = intrinsic.copy()
+    x_scale = float(target_width) / float(source_width)
+    y_scale = float(target_height) / float(source_height)
+    scaled[0, :] *= x_scale
+    scaled[1, :] *= y_scale
+    return scaled
+
+
+def _resize_frame(
+    color_rgb: np.ndarray,
+    depth_m: np.ndarray,
+    intrinsic: np.ndarray,
+    target_width: int,
+    target_height: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    source_height, source_width = color_rgb.shape[:2]
+    if target_width <= 0:
+        target_width = source_width
+    if target_height <= 0:
+        target_height = source_height
+
+    if source_width != target_width or source_height != target_height:
+        color_rgb = cv2.resize(
+            color_rgb,
+            (target_width, target_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        intrinsic = _scale_intrinsic(
+            intrinsic,
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+        )
+
+    if depth_m.shape[1] != target_width or depth_m.shape[0] != target_height:
+        depth_m = cv2.resize(
+            depth_m,
+            (target_width, target_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    return (
+        np.ascontiguousarray(color_rgb),
+        np.ascontiguousarray(depth_m.astype(np.float32, copy=False)),
+        intrinsic,
+    )
+
+
+class OpenLexScenePublisher(Node):
+    def __init__(self):
+        super().__init__("publish_openlex_scene")
+
+        dataset = str(self.declare_parameter("dataset", "hm3d").value)
+        if dataset == "scannet":
+            dataset = "scannetpp"
+        if dataset not in {"hm3d", "scannetpp"}:
+            raise ValueError(f"unsupported dataset: {dataset}")
+
+        dataset_root = pathlib.Path(str(self.declare_parameter("dataset_root", "").value))
+        scene_name = str(self.declare_parameter("scene_name", "").value).strip("'\"")
+        self._robot_frame = str(self.declare_parameter("robot_frame", "base_link_gt").value)
+        self._odom_frame = str(self.declare_parameter("odom_frame", "world").value)
+        self._sensor_frame = str(self.declare_parameter("sensor_frame", "left_cam").value)
+        self._rate_hz = float(self.declare_parameter("rate", 10.0).value)
+        self._start_frame = int(self.declare_parameter("start_frame", 0).value)
+        self._stride = int(self.declare_parameter("stride", 1).value)
+        self._max_frames = int(self.declare_parameter("max_frames", 0).value)
+        self._target_width = int(self.declare_parameter("target_width", 0).value)
+        self._target_height = int(self.declare_parameter("target_height", 0).value)
+        source_fps_override = float(self.declare_parameter("source_fps", 0.0).value)
+        use_aligned_pose = bool(self.declare_parameter("use_aligned_pose", True).value)
+        start_paused = bool(self.declare_parameter("start_paused", False).value)
+        self.declare_parameter("paused", start_paused)
+        self._paused = start_paused
+        self.add_on_set_parameters_callback(self._handle_parameter_update)
+
+        if not str(dataset_root):
+            raise ValueError("dataset_root must be set")
+        if not scene_name:
+            raise ValueError("scene_name must be set")
+        if self._rate_hz <= 0.0:
+            raise ValueError("rate must be greater than zero")
+        if self._start_frame < 0:
+            raise ValueError("start_frame must be non-negative")
+        if self._stride <= 0:
+            raise ValueError("stride must be positive")
+        if self._max_frames < 0:
+            raise ValueError("max_frames must be non-negative")
+        if self._target_width < 0 or self._target_height < 0:
+            raise ValueError("target_width and target_height must be non-negative")
+        if source_fps_override < 0.0:
+            raise ValueError("source_fps must be non-negative")
+
+        scene_root = _resolve_scene_root(dataset_root, dataset, scene_name)
+        if dataset == "hm3d":
+            self._source: SceneFrameSource = HM3DWalkFrameSource(scene_root)
+        else:
+            self._source = ScannetppIPhoneFrameSource(scene_root, use_aligned_pose)
+        self._source_fps = source_fps_override or self._source.native_fps or self._rate_hz
+
+        frame_count = self._source.frame_count
+        if self._start_frame >= frame_count:
+            raise ValueError(
+                f"start_frame {self._start_frame} is outside the available frame range "
+                f"[0, {frame_count - 1}]"
+            )
+        remaining_frames = 1 + (frame_count - 1 - self._start_frame) // self._stride
+        self._planned_frame_count = (
+            min(remaining_frames, self._max_frames) if self._max_frames > 0 else remaining_frames
+        )
+
+        clock_qos = QoSProfile(depth=1)
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self._dataset = dataset
+        self._scene_name = scene_name
+        self._scene_root = scene_root
+        self._clock_pub = self.create_publisher(Clock, "/clock", clock_qos)
+        self._rgb_pub = self.create_publisher(Image, "rgb/image_raw", sensor_qos)
+        self._depth_pub = self.create_publisher(Image, "depth_registered/image_rect", sensor_qos)
+        self._camera_info_pub = self.create_publisher(CameraInfo, "camera_info", sensor_qos)
+        self._tf_pub = TransformBroadcaster(self)
+        self._tf_static_pub = StaticTransformBroadcaster(self)
+
+        self._publish_static_tf()
+
+        self._next_frame_index = self._start_frame
+        self._published_frames = 0
+        self._timer = self.create_timer(1.0 / self._rate_hz, self._publish_next_frame)
+
+        target_desc = (
+            "native"
+            if self._target_width <= 0 or self._target_height <= 0
+            else f"{self._target_width}x{self._target_height}"
+        )
+        self.get_logger().info(
+            "Publishing OpenLex %s scene '%s' from %s "
+            "(start_frame=%d, stride=%d, rate=%.2f Hz, source_fps=%.2f Hz, max_frames=%s, "
+            "planned_frames=%d, target=%s, paused=%s)"
+            % (
+                dataset,
+                scene_name,
+                scene_root,
+                self._start_frame,
+                self._stride,
+                self._rate_hz,
+                self._source_fps,
+                ("unbounded" if self._max_frames <= 0 else str(self._max_frames)),
+                self._planned_frame_count,
+                target_desc,
+                self._paused,
+            )
+        )
+
+    def _handle_parameter_update(
+        self, params: Sequence[Parameter]
+    ) -> SetParametersResult:
+        for param in params:
+            if param.name != "paused":
+                continue
+            if param.type_ != Parameter.Type.BOOL:
+                return SetParametersResult(successful=False, reason="paused must be a bool")
+            self._paused = bool(param.value)
+            state = "paused" if self._paused else "resumed"
+            self.get_logger().info(f"OpenLex playback {state}")
+
+        return SetParametersResult(successful=True)
+
+    def _publish_static_tf(self) -> None:
+        if self._robot_frame == self._sensor_frame:
+            return
+
+        transform = TransformStamped()
+        transform.header.frame_id = self._robot_frame
+        transform.child_frame_id = self._sensor_frame
+        transform.transform.rotation.w = 1.0
+        self._tf_static_pub.sendTransform(transform)
+
+    def _current_stamp(self, frame_index: int):
+        stamp_ns = self._source.timestamp_ns(frame_index, self._source_fps)
+        return rclpy.time.Time(nanoseconds=stamp_ns).to_msg()
+
+    def _publish_clock(self, stamp) -> None:
+        msg = Clock()
+        msg.clock = stamp
+        self._clock_pub.publish(msg)
+
+    def _publish_tf(self, stamp, pose: np.ndarray) -> None:
+        quat = _rotation_matrix_to_quaternion(pose[:3, :3])
+        transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = self._odom_frame
+        transform.child_frame_id = self._robot_frame
+        transform.transform.translation.x = float(pose[0, 3])
+        transform.transform.translation.y = float(pose[1, 3])
+        transform.transform.translation.z = float(pose[2, 3])
+        transform.transform.rotation.w = float(quat[0])
+        transform.transform.rotation.x = float(quat[1])
+        transform.transform.rotation.y = float(quat[2])
+        transform.transform.rotation.z = float(quat[3])
+        self._tf_pub.sendTransform(transform)
+
+    def _stop_publishing(self, reason: str) -> None:
+        self.get_logger().info(
+            "Finished publishing OpenLex %s/%s after %d frames (%s)"
+            % (self._dataset, self._scene_name, self._published_frames, reason)
+        )
+        self._timer.cancel()
+        rclpy.shutdown()
+
+    def _publish_next_frame(self) -> None:
+        if self._paused:
+            return
+
+        if self._max_frames > 0 and self._published_frames >= self._max_frames:
+            self._stop_publishing(f"reached max_frames={self._max_frames}")
+            return
+
+        if self._next_frame_index >= self._source.frame_count:
+            self._stop_publishing("exhausted available frames")
+            return
+
+        color_rgb, depth_m, pose, intrinsic = self._source.load_frame(self._next_frame_index)
+        color_rgb, depth_m, intrinsic = _resize_frame(
+            color_rgb,
+            depth_m,
+            intrinsic,
+            self._target_width,
+            self._target_height,
+        )
+
+        stamp = self._current_stamp(self._next_frame_index)
+        self._publish_tf(stamp, pose)
+        self._publish_clock(stamp)
+
+        height, width = color_rgb.shape[:2]
+        rgb_msg = _make_image_msg(stamp, self._sensor_frame, color_rgb, "rgb8")
+        depth_msg = _make_image_msg(stamp, self._sensor_frame, depth_m, "32FC1")
+        camera_info = _make_camera_info(stamp, self._sensor_frame, width, height, intrinsic)
+
+        self._rgb_pub.publish(rgb_msg)
+        self._depth_pub.publish(depth_msg)
+        self._camera_info_pub.publish(camera_info)
+
+        self._published_frames += 1
+        self._next_frame_index += self._stride
+
+        if self._max_frames > 0 and self._published_frames >= self._max_frames:
+            self._stop_publishing(f"reached max_frames={self._max_frames}")
+
+    def destroy_node(self) -> bool:
+        self._source.close()
+        return super().destroy_node()
+
+
+def main(args=None) -> int:
+    rclpy.init(args=args)
+    node: Optional[OpenLexScenePublisher] = None
+    try:
+        node = OpenLexScenePublisher()
+        rclpy.spin(node)
+        return 0
+    except Exception as exc:  # pragma: no cover - exercised by runtime smoke tests.
+        message = f"Failed to start OpenLex scene publisher: {exc}"
+        if node is not None:
+            node.get_logger().fatal(message)
+        else:
+            print(message, file=sys.stderr)
+        return 1
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.utilities.try_shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

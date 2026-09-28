@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Query TrackGraph's live open-vocabulary object service."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import rclpy
+from hydra_msgs.srv import QueryOpenVocabObjects
+from sensor_msgs.msg import CompressedImage
+
+
+DEFAULT_MIN_MESH_VERTICES = 20
+
+
+class AppendQueryInput(argparse.Action):
+    """Collect heterogeneous query inputs while preserving CLI order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        del parser, option_string
+        query_inputs = list(getattr(namespace, self.dest, None) or [])
+        query_inputs.append((self.const, values))
+        setattr(namespace, self.dest, query_inputs)
+
+
+def load_query_feature(path: Path) -> tuple[list[float], str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"query feature does not exist: {path}")
+
+    if path.suffix == ".npy":
+        import numpy as np
+
+        return np.asarray(np.load(str(path)), dtype=float).reshape(-1).tolist(), ""
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    encoder_id = ""
+    if isinstance(data, dict):
+        feature = data.get("feature", data.get("embedding"))
+        encoder_id = data.get("encoder_id", "")
+        if feature is None:
+            raise ValueError(f"{path} must contain 'feature' or 'embedding'")
+    else:
+        feature = data
+
+    if not isinstance(encoder_id, str):
+        encoder_id = ""
+    return [float(value) for value in feature], encoder_id
+
+
+def load_query_image(path: Path) -> CompressedImage:
+    if not path.is_file():
+        raise FileNotFoundError(f"query image does not exist: {path}")
+
+    image_bytes = path.read_bytes()
+    if not image_bytes:
+        raise ValueError(f"query image is empty: {path}")
+
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix == "jpg":
+        suffix = "jpeg"
+
+    message = CompressedImage()
+    message.format = suffix or "compressed"
+    message.data = image_bytes
+    return message
+
+
+def response_to_dict(response: Any) -> dict[str, Any]:
+    return {
+        "success": bool(response.success),
+        "message": response.message,
+        "encoder_id": response.encoder_id,
+        "mapping_stopped": bool(response.mapping_stopped),
+        "objects_total": int(response.objects_total),
+        "objects_considered": int(response.objects_considered),
+        "objects_skipped": {
+            reason: int(count)
+            for reason, count in zip(response.skip_reasons, response.skip_counts)
+        },
+        "results": [
+            {
+                "rank": index + 1,
+                "node_id": int(result.node_id),
+                "object_uid": int(result.object_uid),
+                "score": float(result.score),
+                "mean_score": (
+                    float(result.mean_score) if result.has_mean_score else None
+                ),
+                "best_feature_column": int(result.best_feature_column),
+                "best_source_track_id": int(result.best_source_track_id),
+                "num_feature_columns": int(result.num_feature_columns),
+                "num_mesh_vertices": int(result.num_mesh_vertices),
+                "source_track_ids": [int(value) for value in result.source_track_ids],
+                "open_vocab_encoder_id": result.open_vocab_encoder_id,
+                "is_active": bool(result.is_active),
+                "ignored": bool(result.ignored),
+                "centroid_xyz": (
+                    [result.centroid.x, result.centroid.y, result.centroid.z]
+                    if result.has_centroid
+                    else None
+                ),
+                "bbox_valid": bool(result.bbox_valid),
+                "bbox_type": result.bbox_type,
+                "bbox_center_xyz": [
+                    result.bbox_center.x,
+                    result.bbox_center.y,
+                    result.bbox_center.z,
+                ],
+                "bbox_dims_xyz": [
+                    result.bbox_dimensions.x,
+                    result.bbox_dimensions.y,
+                    result.bbox_dimensions.z,
+                ],
+            }
+            for index, result in enumerate(response.results)
+        ],
+    }
+
+
+def print_table(payload: dict[str, Any]) -> None:
+    print(
+        "success={success} mapping_stopped={mapping_stopped} encoder={encoder_id}".format(
+            **payload
+        )
+    )
+    print(
+        "objects: total={objects_total} considered={objects_considered} skipped={objects_skipped}".format(
+            **payload
+        )
+    )
+    if payload["message"]:
+        print(f"message: {payload['message']}")
+    if not payload["results"]:
+        return
+
+    headers = ("rank", "score", "node_id", "uid", "best_track", "vertices", "centroid")
+    rows = []
+    for result in payload["results"]:
+        centroid = result["centroid_xyz"]
+        centroid_text = (
+            "n/a"
+            if centroid is None
+            else "[%.3f, %.3f, %.3f]" % tuple(float(v) for v in centroid)
+        )
+        rows.append(
+            (
+                str(result["rank"]),
+                f"{result['score']:.3f}",
+                str(result["node_id"]),
+                str(result["object_uid"]),
+                str(result["best_source_track_id"]),
+                str(result["num_mesh_vertices"]),
+                centroid_text,
+            )
+        )
+
+    widths = [len(header) for header in headers]
+    for row in rows:
+        widths = [max(width, len(cell)) for width, cell in zip(widths, row)]
+    fmt = "  ".join("{:<%d}" % width for width in widths)
+    print(fmt.format(*headers))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def resolve_top_ks(query_count: int, values: list[int]) -> list[int]:
+    """Expand one shared top-k or validate one top-k per query input."""
+
+    if query_count <= 0:
+        return []
+    if not values:
+        return [5] * query_count
+    if len(values) == 1:
+        return [max(0, int(values[0]))] * query_count
+    if len(values) != query_count:
+        raise ValueError(
+            "provide either one --top-k value or one value per query "
+            f"({query_count} queries, {len(values)} values)"
+        )
+    return [max(0, int(value)) for value in values]
+
+
+def resolve_min_mesh_vertices(value: int | None) -> int:
+    """Preserve the existing threshold unless the user explicitly overrides it."""
+
+    if value is None:
+        return DEFAULT_MIN_MESH_VERTICES
+    return max(0, int(value))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--service", default="/hydra/query_open_vocab_objects")
+    parser.add_argument(
+        "--text",
+        "--query",
+        dest="query_inputs",
+        action=AppendQueryInput,
+        const="text",
+        default=[],
+        help=(
+            "Text prompt; repeat or combine with --image for simultaneous "
+            "visualization. "
+            "--query is retained as a compatibility alias"
+        ),
+    )
+    parser.add_argument(
+        "--image",
+        dest="query_inputs",
+        action=AppendQueryInput,
+        const="image",
+        help="Path to a query image; repeat or combine with --text",
+    )
+    parser.add_argument(
+        "--query-feature",
+        dest="query_inputs",
+        action=AppendQueryInput,
+        const="feature",
+        help="Path to a saved query feature; repeat or combine with other inputs",
+    )
+    parser.add_argument("--query-encoder-id", default="")
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        action="append",
+        default=[],
+        help="One value shared by all queries, or one value per query input",
+    )
+    parser.add_argument(
+        "--min-mesh-vertices",
+        type=int,
+        default=None,
+        help=(
+            "Ignore objects with fewer mesh vertices; "
+            f"default: {DEFAULT_MIN_MESH_VERTICES}"
+        ),
+    )
+    parser.add_argument("--include-ignored", action="store_true")
+    parser.add_argument("--allow-encoder-mismatch", action="store_true")
+    parser.add_argument("--stop-mapping", action="store_true")
+    parser.add_argument(
+        "--append-to-visualization",
+        action="store_true",
+        help="Retain visualized queries from an earlier invocation",
+    )
+    parser.add_argument("--timeout-sec", type=float, default=30.0)
+    parser.add_argument("--output-json", default="")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if not args.query_inputs:
+        print(
+            "error: --text, --image, or --query-feature is required",
+            file=sys.stderr,
+        )
+        return 2
+
+    query_count = len(args.query_inputs)
+    try:
+        top_ks = resolve_top_ks(query_count, args.top_k)
+        min_mesh_vertices = resolve_min_mesh_vertices(args.min_mesh_vertices)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    prepared_queries = []
+    for query_type, query_input in args.query_inputs:
+        query_feature: list[float] = []
+        query_encoder_id = args.query_encoder_id
+        query_image = CompressedImage()
+        try:
+            if query_type == "image":
+                query_image = load_query_image(Path(query_input).expanduser())
+            elif query_type == "feature":
+                query_feature, file_encoder_id = load_query_feature(
+                    Path(query_input).expanduser()
+                )
+                query_encoder_id = query_encoder_id or file_encoder_id
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        prepared_queries.append(
+            (query_type, query_input, query_image, query_feature, query_encoder_id)
+        )
+
+    rclpy.init(args=None)
+    node = rclpy.create_node("hydra_open_vocab_object_query_client")
+    try:
+        client = node.create_client(QueryOpenVocabObjects, args.service)
+        if not client.wait_for_service(timeout_sec=args.timeout_sec):
+            print(
+                f"error: timed out waiting for service {args.service}",
+                file=sys.stderr,
+            )
+            return 1
+
+        payloads: list[dict[str, Any]] = []
+        for index, prepared_query in enumerate(prepared_queries):
+            query_type, query_input, query_image, query_feature, query_encoder_id = (
+                prepared_query
+            )
+            request = QueryOpenVocabObjects.Request()
+            request.query = query_input if query_type == "text" else ""
+            request.query_image = query_image
+            request.query_feature = query_feature
+            request.query_encoder_id = query_encoder_id
+            request.top_k = top_ks[index]
+            request.min_mesh_vertices = min_mesh_vertices
+            request.include_ignored = bool(args.include_ignored)
+            request.allow_encoder_mismatch = bool(args.allow_encoder_mismatch)
+            request.stop_mapping = bool(args.stop_mapping and index == 0)
+            request.append_to_visualization = bool(
+                args.append_to_visualization or index > 0
+            )
+
+            future = client.call_async(request)
+            rclpy.spin_until_future_complete(
+                node, future, timeout_sec=args.timeout_sec
+            )
+            if not future.done() or future.result() is None:
+                print(
+                    f"error: query {index + 1} service call did not return a response",
+                    file=sys.stderr,
+                )
+                return 1
+
+            payload = response_to_dict(future.result())
+            payload["query_type"] = query_type
+            payload["query_input"] = query_input
+            payload["top_k"] = top_ks[index]
+            payload["min_mesh_vertices"] = min_mesh_vertices
+            if len(prepared_queries) > 1:
+                print(
+                    f"\nquery {index + 1}/{len(prepared_queries)} "
+                    f"({query_type}): {query_input}"
+                )
+            print_table(payload)
+            payloads.append(payload)
+
+        output_payload: dict[str, Any]
+        if len(payloads) == 1:
+            output_payload = payloads[0]
+        else:
+            output_payload = {
+                "success": all(payload["success"] for payload in payloads),
+                "queries": payloads,
+            }
+        if args.output_json:
+            output_path = Path(args.output_json).expanduser().resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(output_payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return 0 if output_payload["success"] else 1
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

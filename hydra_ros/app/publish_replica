@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Publish NICE-SLAM Replica folders as ROS2 RGB-D topics."""
+
+import json
+import math
+import pathlib
+import re
+import sys
+import time
+from typing import List, Sequence, Tuple
+
+import cv2
+import numpy as np
+import rclpy
+import rclpy.utilities
+from geometry_msgs.msg import TransformStamped
+from rcl_interfaces.msg import SetParametersResult
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+
+
+def _parse_file_index(path: pathlib.Path, prefix: str, suffix: str) -> int:
+    match = re.fullmatch(rf"{re.escape(prefix)}(\d+)\.{re.escape(suffix)}", path.name)
+    if not match:
+        raise ValueError(f"unexpected Replica filename: {path}")
+    return int(match.group(1))
+
+
+def _resolve_replica_root(dataset_root: pathlib.Path) -> pathlib.Path:
+    dataset_root = dataset_root.expanduser()
+    candidate = dataset_root / "Datasets" / "Replica"
+    if candidate.is_dir():
+        return candidate
+    if (dataset_root / "cam_params.json").is_file():
+        return dataset_root
+    raise ValueError(
+        "dataset_root must either be a NICE-SLAM checkout containing "
+        "'Datasets/Replica' or a Replica root containing 'cam_params.json'"
+    )
+
+
+def _load_camera_info(replica_root: pathlib.Path) -> Tuple[CameraInfo, float]:
+    cam_params_path = replica_root / "cam_params.json"
+    if not cam_params_path.is_file():
+        raise ValueError(f"missing Replica camera intrinsics file: {cam_params_path}")
+
+    with cam_params_path.open("r", encoding="utf-8") as fin:
+        payload = json.load(fin)
+
+    camera = payload.get("camera", {})
+    required = ("w", "h", "fx", "fy", "cx", "cy", "scale")
+    missing = [key for key in required if key not in camera]
+    if missing:
+        raise ValueError(
+            f"cam_params.json is missing required fields: {', '.join(sorted(missing))}"
+        )
+
+    info = CameraInfo()
+    info.width = int(camera["w"])
+    info.height = int(camera["h"])
+    info.distortion_model = "plumb_bob"
+    info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+    info.k = [
+        float(camera["fx"]),
+        0.0,
+        float(camera["cx"]),
+        0.0,
+        float(camera["fy"]),
+        float(camera["cy"]),
+        0.0,
+        0.0,
+        1.0,
+    ]
+    info.r = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    info.p = [
+        float(camera["fx"]),
+        0.0,
+        float(camera["cx"]),
+        0.0,
+        0.0,
+        float(camera["fy"]),
+        float(camera["cy"]),
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+    return info, float(camera["scale"])
+
+
+def _load_scene_paths(scene_root: pathlib.Path) -> Tuple[List[pathlib.Path], List[pathlib.Path]]:
+    results_root = scene_root / "results"
+    if not results_root.is_dir():
+        raise ValueError(f"missing Replica results directory: {results_root}")
+
+    color_paths = sorted(results_root.glob("frame*.jpg"))
+    depth_paths = sorted(results_root.glob("depth*.png"))
+    if not color_paths:
+        raise ValueError(f"no Replica color frames found in {results_root}")
+    if not depth_paths:
+        raise ValueError(f"no Replica depth frames found in {results_root}")
+    if len(color_paths) != len(depth_paths):
+        raise ValueError(
+            f"mismatched Replica frame counts: {len(color_paths)} color vs "
+            f"{len(depth_paths)} depth images"
+        )
+
+    color_indices = [_parse_file_index(path, "frame", "jpg") for path in color_paths]
+    depth_indices = [_parse_file_index(path, "depth", "png") for path in depth_paths]
+    if color_indices != depth_indices:
+        raise ValueError("Replica color and depth filenames do not share the same frame ids")
+
+    return color_paths, depth_paths
+
+
+def _load_poses(scene_root: pathlib.Path) -> List[np.ndarray]:
+    traj_path = scene_root / "traj.txt"
+    if not traj_path.is_file():
+        raise ValueError(f"missing Replica trajectory file: {traj_path}")
+
+    poses: List[np.ndarray] = []
+    with traj_path.open("r", encoding="utf-8") as fin:
+        for line_number, raw_line in enumerate(fin, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            fields = line.split()
+            if len(fields) != 16:
+                raise ValueError(
+                    f"invalid pose at {traj_path}:{line_number}: expected 16 values, "
+                    f"got {len(fields)}"
+                )
+
+            # Publish Replica using the same raw pose convention as reasoning_hydra_ros.
+            pose = np.array([float(value) for value in fields], dtype=np.float64).reshape(4, 4)
+            poses.append(pose)
+
+    if not poses:
+        raise ValueError(f"Replica trajectory file is empty: {traj_path}")
+
+    return poses
+
+
+def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * scale
+        qx = (rotation[2, 1] - rotation[1, 2]) / scale
+        qy = (rotation[0, 2] - rotation[2, 0]) / scale
+        qz = (rotation[1, 0] - rotation[0, 1]) / scale
+    elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
+        scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+        qw = (rotation[2, 1] - rotation[1, 2]) / scale
+        qx = 0.25 * scale
+        qy = (rotation[0, 1] + rotation[1, 0]) / scale
+        qz = (rotation[0, 2] + rotation[2, 0]) / scale
+    elif rotation[1, 1] > rotation[2, 2]:
+        scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+        qw = (rotation[0, 2] - rotation[2, 0]) / scale
+        qx = (rotation[0, 1] + rotation[1, 0]) / scale
+        qy = 0.25 * scale
+        qz = (rotation[1, 2] + rotation[2, 1]) / scale
+    else:
+        scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+        qw = (rotation[1, 0] - rotation[0, 1]) / scale
+        qx = (rotation[0, 2] + rotation[2, 0]) / scale
+        qy = (rotation[1, 2] + rotation[2, 1]) / scale
+        qz = 0.25 * scale
+
+    quat = np.array([qw, qx, qy, qz], dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm == 0.0:
+        raise ValueError("invalid rotation matrix produced a zero quaternion")
+    return quat / norm
+
+
+def _make_image_msg(stamp, frame_id: str, image: np.ndarray, encoding: str) -> Image:
+    msg = Image()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = int(image.shape[0])
+    msg.width = int(image.shape[1])
+    msg.encoding = encoding
+    msg.is_bigendian = False
+    msg.step = int(image.strides[0])
+    msg.data = image.tobytes()
+    return msg
+
+
+class ReplicaPublisher(Node):
+    def __init__(self):
+        super().__init__("publish_replica")
+
+        dataset_root = pathlib.Path(
+            self.declare_parameter("dataset_root", "/hostwork/datasets/nice-slam").value
+        )
+        scene_name = str(self.declare_parameter("scene_name", "room0").value)
+        self._robot_frame = str(self.declare_parameter("robot_frame", "base_link_gt").value)
+        self._odom_frame = str(self.declare_parameter("odom_frame", "world").value)
+        self._sensor_frame = str(self.declare_parameter("sensor_frame", "left_cam").value)
+        self._rate_hz = float(self.declare_parameter("rate", 10.0).value)
+        configured_source_fps = float(
+            self.declare_parameter("source_fps", 0.0).value
+        )
+        self._source_fps = (
+            configured_source_fps if configured_source_fps > 0.0 else self._rate_hz
+        )
+        self._start_frame = int(self.declare_parameter("start_frame", 0).value)
+        self._stride = int(self.declare_parameter("stride", 1).value)
+        self._max_frames = int(self.declare_parameter("max_frames", 0).value)
+        self._delivery_ack_timeout_s = float(
+            self.declare_parameter("delivery_ack_timeout_s", 0.0).value
+        )
+        start_paused = bool(self.declare_parameter("start_paused", False).value)
+        self.declare_parameter("paused", start_paused)
+        self._paused = start_paused
+        self.add_on_set_parameters_callback(self._handle_parameter_update)
+
+        if self._rate_hz <= 0.0:
+            raise ValueError("rate must be greater than zero")
+        if configured_source_fps < 0.0:
+            raise ValueError("source_fps must be non-negative")
+        if self._start_frame < 0:
+            raise ValueError("start_frame must be non-negative")
+        if self._stride <= 0:
+            raise ValueError("stride must be positive")
+        if self._max_frames < 0:
+            raise ValueError("max_frames must be non-negative")
+        if self._delivery_ack_timeout_s < 0.0:
+            raise ValueError("delivery_ack_timeout_s must be non-negative")
+
+        self._replica_root = _resolve_replica_root(dataset_root)
+        self._scene_root = self._replica_root / scene_name
+        if not self._scene_root.is_dir():
+            raise ValueError(f"Replica scene does not exist: {self._scene_root}")
+
+        self._camera_info_template, self._depth_scale = _load_camera_info(self._replica_root)
+        self._camera_info_template.header.frame_id = self._sensor_frame
+        self._color_paths, self._depth_paths = _load_scene_paths(self._scene_root)
+        self._poses = _load_poses(self._scene_root)
+
+        frame_count = len(self._color_paths)
+        if len(self._poses) != frame_count:
+            raise ValueError(
+                f"mismatched Replica data counts: {frame_count} RGB, "
+                f"{len(self._depth_paths)} depth, {len(self._poses)} poses"
+            )
+        if self._start_frame >= frame_count:
+            raise ValueError(
+                f"start_frame {self._start_frame} is outside the available frame range "
+                f"[0, {frame_count - 1}]"
+            )
+        remaining_frames = 1 + (frame_count - 1 - self._start_frame) // self._stride
+        self._planned_frame_count = (
+            min(remaining_frames, self._max_frames) if self._max_frames > 0 else remaining_frames
+        )
+
+        clock_qos = QoSProfile(depth=1)
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self._clock_pub = self.create_publisher(Clock, "/clock", clock_qos)
+        self._rgb_pub = self.create_publisher(Image, "rgb/image_raw", sensor_qos)
+        self._depth_pub = self.create_publisher(Image, "depth_registered/image_rect", sensor_qos)
+        self._camera_info_pub = self.create_publisher(CameraInfo, "camera_info", sensor_qos)
+        self._tf_pub = TransformBroadcaster(self)
+        self._tf_static_pub = StaticTransformBroadcaster(self)
+
+        self._publish_static_tf()
+
+        self._next_frame_index = self._start_frame
+        self._published_frames = 0
+        self._timer = self.create_timer(1.0 / self._rate_hz, self._publish_next_frame)
+
+        self.get_logger().info(
+            "Publishing Replica scene '%s' from %s (resolved root: %s, start_frame=%d, "
+            "stride=%d, rate=%.2f Hz, source_fps=%.2f Hz, max_frames=%s, "
+            "planned_frames=%d, paused=%s, "
+            "delivery_ack_timeout_s=%.2f)"
+            % (
+                scene_name,
+                dataset_root,
+                self._replica_root,
+                self._start_frame,
+                self._stride,
+                self._rate_hz,
+                self._source_fps,
+                ("unbounded" if self._max_frames <= 0 else str(self._max_frames)),
+                self._planned_frame_count,
+                self._paused,
+                self._delivery_ack_timeout_s,
+            )
+        )
+
+    def _handle_parameter_update(
+        self, params: Sequence[Parameter]
+    ) -> SetParametersResult:
+        for param in params:
+            if param.name != "paused":
+                continue
+            if param.type_ != Parameter.Type.BOOL:
+                return SetParametersResult(successful=False, reason="paused must be a bool")
+            self._paused = bool(param.value)
+            state = "paused" if self._paused else "resumed"
+            self.get_logger().info(f"Replica playback {state}")
+
+        return SetParametersResult(successful=True)
+
+    def _publish_static_tf(self) -> None:
+        if self._robot_frame == self._sensor_frame:
+            return
+
+        transform = TransformStamped()
+        transform.header.frame_id = self._robot_frame
+        transform.child_frame_id = self._sensor_frame
+        transform.transform.rotation.w = 1.0
+        self._tf_static_pub.sendTransform(transform)
+
+    def _current_stamp(self):
+        stamp_ns = int(round(self._published_frames * 1.0e9 / self._source_fps))
+        return rclpy.time.Time(nanoseconds=stamp_ns).to_msg()
+
+    def _publish_clock(self, stamp) -> None:
+        msg = Clock()
+        msg.clock = stamp
+        self._clock_pub.publish(msg)
+
+    def _publish_camera_info(self, stamp) -> None:
+        camera_info = CameraInfo()
+        camera_info.header.stamp = stamp
+        camera_info.header.frame_id = self._sensor_frame
+        camera_info.height = self._camera_info_template.height
+        camera_info.width = self._camera_info_template.width
+        camera_info.distortion_model = self._camera_info_template.distortion_model
+        camera_info.d = list(self._camera_info_template.d)
+        camera_info.k = list(self._camera_info_template.k)
+        camera_info.r = list(self._camera_info_template.r)
+        camera_info.p = list(self._camera_info_template.p)
+        self._camera_info_pub.publish(camera_info)
+
+    def _publish_tf(self, stamp, pose: np.ndarray) -> None:
+        quat = _rotation_matrix_to_quaternion(pose[:3, :3])
+        transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = self._odom_frame
+        transform.child_frame_id = self._robot_frame
+        transform.transform.translation.x = float(pose[0, 3])
+        transform.transform.translation.y = float(pose[1, 3])
+        transform.transform.translation.z = float(pose[2, 3])
+        transform.transform.rotation.w = float(quat[0])
+        transform.transform.rotation.x = float(quat[1])
+        transform.transform.rotation.y = float(quat[2])
+        transform.transform.rotation.z = float(quat[3])
+        self._tf_pub.sendTransform(transform)
+
+    def _wait_for_delivery_acknowledgements(self) -> None:
+        if self._delivery_ack_timeout_s <= 0.0:
+            return
+
+        deadline = time.monotonic() + self._delivery_ack_timeout_s
+        timed_out = []
+        publishers = (
+            ("clock", self._clock_pub),
+            ("rgb", self._rgb_pub),
+            ("depth", self._depth_pub),
+            ("camera_info", self._camera_info_pub),
+        )
+        for label, publisher in publishers:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                acknowledged = publisher.wait_for_all_acked(
+                    Duration(seconds=remaining)
+                )
+            except Exception as exc:  # pragma: no cover - middleware dependent.
+                self.get_logger().warning(
+                    f"Could not wait for {label} delivery acknowledgements: {exc}"
+                )
+                continue
+            if not acknowledged:
+                timed_out.append(label)
+
+        if timed_out:
+            self.get_logger().warning(
+                "Timed out waiting for delivery acknowledgements on: "
+                + ", ".join(timed_out)
+            )
+        else:
+            self.get_logger().info(
+                "All reliable Replica publishers acknowledged their final samples"
+            )
+
+    def _stop_publishing(self, reason: str) -> None:
+        self._timer.cancel()
+        self._wait_for_delivery_acknowledgements()
+        self.get_logger().info(
+            f"Finished publishing Replica scene after {self._published_frames} frames ({reason})"
+        )
+        rclpy.shutdown()
+
+    def _publish_next_frame(self) -> None:
+        if self._paused:
+            # Prime Hydra's camera model and simulated clock before RGB-D playback.
+            # This lets orchestration wait for the actual initialized frontend
+            # without consuming frame zero during DDS discovery.
+            stamp = self._current_stamp()
+            self._publish_clock(stamp)
+            self._publish_camera_info(stamp)
+            return
+
+        if self._max_frames > 0 and self._published_frames >= self._max_frames:
+            self._stop_publishing(f"reached max_frames={self._max_frames}")
+            return
+
+        if self._next_frame_index >= len(self._color_paths):
+            self._stop_publishing("exhausted available frames")
+            return
+
+        color_path = self._color_paths[self._next_frame_index]
+        depth_path = self._depth_paths[self._next_frame_index]
+        pose = self._poses[self._next_frame_index]
+
+        color_bgr = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
+        if color_bgr is None:
+            raise RuntimeError(f"failed to load Replica RGB frame: {color_path}")
+        depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth_raw is None:
+            raise RuntimeError(f"failed to load Replica depth frame: {depth_path}")
+
+        color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        color_rgb = np.ascontiguousarray(color_rgb)
+        depth_m = np.ascontiguousarray(depth_raw.astype(np.float32) / self._depth_scale)
+
+        stamp = self._current_stamp()
+        self._publish_clock(stamp)
+        self._publish_tf(stamp, pose)
+
+        rgb_msg = _make_image_msg(stamp, self._sensor_frame, color_rgb, "rgb8")
+        depth_msg = _make_image_msg(stamp, self._sensor_frame, depth_m, "32FC1")
+
+        self._rgb_pub.publish(rgb_msg)
+        self._depth_pub.publish(depth_msg)
+        self._publish_camera_info(stamp)
+
+        self._published_frames += 1
+        self._next_frame_index += self._stride
+
+        if self._max_frames > 0 and self._published_frames >= self._max_frames:
+            self._stop_publishing(f"reached max_frames={self._max_frames}")
+
+
+def main(args=None) -> int:
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = ReplicaPublisher()
+        rclpy.spin(node)
+        return 0
+    except Exception as exc:  # pragma: no cover - exercised by runtime smoke tests.
+        message = f"Failed to start Replica publisher: {exc}"
+        if node is not None:
+            node.get_logger().fatal(message)
+        else:
+            print(message, file=sys.stderr)
+        return 1
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.utilities.try_shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

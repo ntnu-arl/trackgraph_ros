@@ -1,0 +1,10 @@
+---
+input:
+  type: RosInput
+  tf_verbosity: 1
+  clear_queue_on_fail: true
+  inputs:
+    left_cam:
+      receiver: {type: ClosedSetImageReceiver}
+      sensor: {type: camera_info, min_range: 0.05, max_range: 6.0, extrinsics: {type: ros}}
+features: {type: FeatureReceiver}

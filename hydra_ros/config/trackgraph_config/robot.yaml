@@ -1,0 +1,25 @@
+# TrackGraph live-robot ROS input preset.
+#
+# Keep the internal key `left_cam` for the shared TrackGraph topic contract.
+# Public camera topic names and robot frames are supplied by
+# hydra_ros/launch/trackgraph/trackgraph_robot.launch.yaml.
+---
+input:
+  type: RosInput
+  tf_verbosity: 1
+  clear_queue_on_fail: true
+  inputs:
+    left_cam:
+      receiver: {type: TrackedImageReceiver, queue_size: 50}
+      sensor:
+        type: camera_info
+        min_range: 0.1
+        max_range: 6.0
+        extrinsics: {type: ros}
+features: {type: FeatureReceiver}
+open_vocab_features:
+  type: OpenVocabFeatureReceiver
+  enabled: true
+  topic: tracking/open_vocab_features
+  queue_size: 10
+  verbosity: 0

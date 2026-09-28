@@ -1,0 +1,35 @@
+---
+launch:
+  - arg: {name: dataset_root, description: Path to the local dataset root}
+  - arg: {name: scene_name, default: room0}
+  - arg: {name: namespace, default: replica/left_cam}
+  - arg: {name: robot_frame, default: base_link_gt}
+  - arg: {name: odom_frame, default: world}
+  - arg: {name: sensor_frame, default: left_cam}
+  - arg: {name: rate, default: '10.0'}
+  - arg: {name: source_fps, default: '0.0'}
+  - arg: {name: start_paused, default: 'false'}
+  - arg: {name: delivery_ack_timeout_s, default: '0.0'}
+  - arg: {name: start_frame, default: '0'}
+  - arg: {name: stride, default: '1'}
+  - arg: {name: max_frames, default: '0'}
+  - node:
+      pkg: hydra_ros
+      exec: publish_replica
+      namespace: $(var namespace)
+      name: publish_replica
+      output: screen
+      on_exit: shutdown
+      param:
+        - {name: dataset_root, value: $(var dataset_root), type: str}
+        - {name: scene_name, value: $(var scene_name), type: str}
+        - {name: robot_frame, value: $(var robot_frame), type: str}
+        - {name: odom_frame, value: $(var odom_frame), type: str}
+        - {name: sensor_frame, value: $(var sensor_frame), type: str}
+        - {name: rate, value: $(var rate), type: float}
+        - {name: source_fps, value: $(var source_fps), type: float}
+        - {name: start_paused, value: $(var start_paused)}
+        - {name: delivery_ack_timeout_s, value: $(var delivery_ack_timeout_s), type: float}
+        - {name: start_frame, value: $(var start_frame), type: int}
+        - {name: stride, value: $(var stride), type: int}
+        - {name: max_frames, value: $(var max_frames), type: int}

@@ -1,0 +1,84 @@
+---
+launch:
+  - arg: {name: use_sim_time, default: 'true'}
+  - arg: {name: scene, default: office, description: uhumans2 scene name}
+  - arg: {name: use_gt_semantics, default: 'true'}
+  - arg: {name: use_instance_tracking, default: 'false'}
+  - arg: {name: use_openset_places, default: 'false'}
+  - arg: {name: start_visualizer, default: 'true'}
+  - arg: {name: hydra_extra_yaml_runtime, default: '{}'}
+  - arg: {name: uhumans_hydra_config_path, default: $(find-pkg-share hydra)/config/trackgraph_config/uhumans2.yaml}
+  - arg: {name: uhumans_input_config_path, default: $(find-pkg-share hydra_ros)/config/trackgraph_config/uhumans2.yaml}
+  - arg: {name: trackgraph_common_config_path, default: $(find-pkg-share hydra)/config/trackgraph_config/trackgraph_common_config.yaml}
+  - arg: {name: tracking_instances_topic, default: /tesse/left_cam/tracking/instances}
+  - arg: {name: tracking_open_vocab_features_topic, default: /tesse/left_cam/tracking/open_vocab_features}
+  - arg: {name: tracking_open_vocab_encode_text_service, default: /tesse/left_cam/tracking/open_vocab/encode_text}
+  - arg: {name: tracking_open_vocab_encode_image_service, default: /tesse/left_cam/tracking/open_vocab/encode_image}
+  - arg: {name: labelspace, default: $(if $(var use_gt_semantics) uhumans2_$(var scene) ade20k_full)}
+  - arg: {name: log_prefix, default: uhumans2_$(var scene)}
+  - arg: {name: label_remap_path, default: $(find-pkg-share hydra)/config/label_remaps/uhumans2_$(var scene).yaml}
+  - arg: {name: open_vocab_expected_encoder_id, default: openclip:ViT-B-16:openai:precision=fp16}
+  - set_remap: {from: hydra/input/left_cam/depth_registered/image_rect, to: /tesse/depth_cam/mono/image_raw}
+  - set_remap: {from: hydra/input/left_cam/rgb/image_raw, to: /tesse/left_cam/rgb/image_raw}
+  - set_remap: {from: hydra/input/left_cam/rgb/camera_info, to: /tesse/left_cam/camera_info}
+  - set_remap: {from: hydra/input/left_cam/semantic/image_raw, to: $(if $(var use_gt_semantics) /tesse/seg_cam/converted/image_raw /tesse/left_cam/semantic/image_raw)}
+  - set_remap: {from: hydra/input/left_cam/feature, to: /tesse/left_cam/semantic/feature}
+  - set_remap: {from: hydra/input/left_cam/tracking/instances, to: $(var tracking_instances_topic)}
+  - set_remap: {from: hydra/input/tracking/open_vocab_features, to: $(var tracking_open_vocab_features_topic)}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_text, to: $(var tracking_open_vocab_encode_text_service)}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_image, to: $(var tracking_open_vocab_encode_image_service)}
+  - let: {name: extra_yaml_gt, value: '{semantic_label_remap_filepath: $(var label_remap_path), frontend: {tracked_objects: {open_vocab: {expected_encoder_id: $(var open_vocab_expected_encoder_id)}}}}'}
+  - let: {name: extra_yaml_no_gt, value: '{frontend: {tracked_objects: {open_vocab: {expected_encoder_id: $(var open_vocab_expected_encoder_id)}}}}'}
+  - let: {name: hydra_config_base, value: $(var uhumans_hydra_config_path)}
+  - let: {name: hydra_config_semantic, value: $(find-pkg-share hydra)/config/modes/semantic_reconstruction.yaml}
+  - let: {name: trackgraph_common_config, value: $(var trackgraph_common_config_path)}
+  - let: {name: hydra_config_empty, value: $(find-pkg-share hydra)/config/modes/empty.yaml}
+  - let: {name: input_config_standard, value: $(find-pkg-share hydra_ros)/config/datasets/uhumans2.yaml}
+  - let: {name: input_config_tracked, value: $(var uhumans_input_config_path)}
+  - let: {name: input_config_empty, value: $(find-pkg-share hydra_ros)/config/modes/empty.yaml}
+  - let: {name: visualizer_config_default, value: $(find-pkg-share hydra_visualizer)/config/visualizer_config.yaml}
+  - let: {name: visualizer_config_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_config_tracked.yaml}
+  - let: {name: visualizer_plugins_default, value: $(find-pkg-share hydra_visualizer)/config/visualizer_plugins.yaml}
+  - let: {name: visualizer_plugins_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_plugins_tracked.yaml}
+  - let: {name: rviz_default, value: $(find-pkg-share hydra_visualizer)/rviz/streaming_visualizer.rviz}
+  - let: {name: rviz_tracked, value: $(find-pkg-share hydra_visualizer)/rviz/tracked_streaming_visualizer.rviz}
+  - group:
+      - push_ros_namespace: {namespace: tesse/left_cam}
+      - set_remap: {from: color/image_raw, to: rgb/image_raw}
+      - include:
+          if: $(not $(var use_gt_semantics))
+          file: $(find-pkg-share semantic_inference_ros)/launch/closed_set.launch.yaml
+          arg:
+            - {name: labelspace_name, value: $(var labelspace)}
+      - include:
+          if: $(var use_openset_places)
+          file: $(find-pkg-share semantic_inference_ros)/launch/image_embedding_node.launch.yaml
+          arg:
+            - {name: min_period_s, value: '0.2'}
+  - include:
+      file: $(find-pkg-share hydra_ros)/launch/hydra.launch.yaml
+      arg:
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: dataset, value: uhumans2}
+        - {name: labelspace, value: $(var labelspace)}
+        - {name: log_name, value: $(var log_prefix)}
+        - {name: hydra_config_path, value: $(var hydra_config_base)}
+        - {name: hydra_overlay_config_path, value: $(if $(var use_instance_tracking) $(var trackgraph_common_config) $(var hydra_config_semantic))}
+        - {name: input_config_path, value: $(if $(var use_instance_tracking) $(var input_config_tracked) $(var input_config_standard))}
+        - {name: input_overlay_config_path, value: $(var input_config_empty)}
+        - {name: visualizer_config_path, value: $(if $(var use_instance_tracking) $(var visualizer_config_tracked) $(var visualizer_config_default))}
+        - {name: visualizer_plugins_path, value: $(if $(var use_instance_tracking) $(var visualizer_plugins_tracked) $(var visualizer_plugins_default))}
+        - {name: rviz_path, value: $(if $(var use_instance_tracking) $(var rviz_tracked) $(var rviz_default))}
+        - {name: start_visualizer, value: $(var start_visualizer)}
+        - {name: sensor_frame, value: left_cam}
+        - {name: robot_frame, value: base_link_gt}
+        - {name: odom_frame, value: world}
+        - {name: map_frame, value: map}
+        - {name: lcd_config_path, value: $(find-pkg-share hydra)/config/lcd/uhumans2.yaml}
+        - {name: extra_yaml, value: $(if $(var use_gt_semantics) $(var extra_yaml_gt) $(var extra_yaml_no_gt))}
+        - {name: extra_yaml_runtime, value: $(var hydra_extra_yaml_runtime)}
+  - node:
+      pkg: tf2_ros
+      name: world_to_map
+      exec: static_transform_publisher
+      args: --frame-id world --child-frame-id map

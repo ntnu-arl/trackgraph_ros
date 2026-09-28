@@ -1,0 +1,35 @@
+---
+launch:
+  # Dataset entry point: the included adapter defines the uHumans2 topics and TF.
+  - arg: {name: use_sim_time, default: 'true'}
+  - arg:
+      name: scene
+      default: office
+      description: uHumans2 scene name
+
+  - arg:
+      name: start_visualizer
+      default: 'true'
+      description: Start the tracked-object visualizer
+
+  - arg:
+      name: hydra_config_path
+      default: $(find-pkg-share hydra)/config/trackgraph_config/uhumans2.yaml
+      description: TrackGraph uHumans2 reconstruction preset
+
+  - arg:
+      name: input_config_path
+      default: $(find-pkg-share hydra_ros)/config/trackgraph_config/uhumans2.yaml
+      description: TrackGraph uHumans2 ROS input preset
+
+  - include:
+      file: $(find-pkg-share hydra_ros)/launch/datasets/uhumans2.launch.yaml
+      arg:
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: scene, value: $(var scene)}
+        - {name: use_gt_semantics, value: 'true'}
+        - {name: use_instance_tracking, value: 'true'}
+        - {name: start_visualizer, value: $(var start_visualizer)}
+        - {name: uhumans_hydra_config_path, value: $(var hydra_config_path)}
+        - {name: uhumans_input_config_path, value: $(var input_config_path)}
+        - {name: open_vocab_expected_encoder_id, value: 'openclip:ViT-B-16:openai:precision=fp16'}

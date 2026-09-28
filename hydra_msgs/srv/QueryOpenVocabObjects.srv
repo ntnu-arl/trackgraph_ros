@@ -1,0 +1,22 @@
+string query
+sensor_msgs/CompressedImage query_image
+float32[] query_feature
+string query_encoder_id
+uint32 top_k
+uint32 min_mesh_vertices
+bool include_ignored
+bool allow_encoder_mismatch
+bool stop_mapping
+# Keep previously visualized query result sets and add this query to them.
+# False preserves the legacy behavior of replacing the current visualization.
+bool append_to_visualization
+---
+bool success
+string message
+string encoder_id
+bool mapping_stopped
+uint32 objects_total
+uint32 objects_considered
+string[] skip_reasons
+uint32[] skip_counts
+hydra_msgs/OpenVocabObjectQueryResult[] results

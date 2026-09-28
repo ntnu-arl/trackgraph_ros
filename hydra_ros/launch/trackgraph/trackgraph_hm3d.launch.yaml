@@ -1,0 +1,64 @@
+# TrackGraph-supported HM3D launch entrypoint.
+---
+launch:
+  - arg: {name: use_sim_time, default: 'true'}
+  - arg: {name: use_instance_tracking, default: 'true'}
+  - arg: {name: hydra_extra_yaml_runtime, default: '{}'}
+  - arg: {name: labelspace, default: ade20k_full}
+  - arg: {name: log_name, default: hm3d}
+  - arg: {name: start_visualizer, default: 'true'}
+  - arg: {name: tracking_instances_topic, default: /hm3d/left_cam/tracking/instances}
+  - arg: {name: tracking_open_vocab_features_topic, default: /hm3d/left_cam/tracking/open_vocab_features}
+  - arg: {name: tracking_open_vocab_encode_text_service, default: /hm3d/left_cam/tracking/open_vocab/encode_text}
+  - arg: {name: tracking_open_vocab_encode_image_service, default: /hm3d/left_cam/tracking/open_vocab/encode_image}
+  - let: {name: hydra_config_base, value: $(find-pkg-share hydra)/config/trackgraph_config/hm3d.yaml}
+  - let: {name: trackgraph_common_config, value: $(find-pkg-share hydra)/config/trackgraph_config/trackgraph_common_config.yaml}
+  - let: {name: hydra_config_empty, value: $(find-pkg-share hydra)/config/modes/empty.yaml}
+  - let: {name: input_config_base, value: $(find-pkg-share hydra_ros)/config/datasets/hm3d.yaml}
+  - let: {name: input_config_tracked, value: $(find-pkg-share hydra_ros)/config/trackgraph_config/hm3d.yaml}
+  - let: {name: input_config_empty, value: $(find-pkg-share hydra_ros)/config/modes/empty.yaml}
+  - let: {name: visualizer_config_default, value: $(find-pkg-share hydra_visualizer)/config/visualizer_config.yaml}
+  - let: {name: visualizer_config_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_config_tracked.yaml}
+  - let: {name: visualizer_plugins_default, value: $(find-pkg-share hydra_visualizer)/config/visualizer_plugins.yaml}
+  - let: {name: visualizer_plugins_tracked, value: $(find-pkg-share hydra_visualizer)/config/visualizer_plugins_tracked.yaml}
+  - let: {name: rviz_hm3d, value: $(find-pkg-share hydra_visualizer)/rviz/hm3d_streaming_visualizer.rviz}
+  - set_remap: {from: hydra/input/left_cam/depth_registered/image_rect, to: /hm3d/left_cam/depth_registered/image_rect}
+  - set_remap: {from: hydra/input/left_cam/rgb/image_raw, to: /hm3d/left_cam/rgb/image_raw}
+  - set_remap: {from: hydra/input/left_cam/rgb/camera_info, to: /hm3d/left_cam/camera_info}
+  - set_remap: {from: hydra/input/left_cam/tracking/instances, to: $(var tracking_instances_topic)}
+  - set_remap: {from: hydra/input/tracking/open_vocab_features, to: $(var tracking_open_vocab_features_topic)}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_text, to: $(var tracking_open_vocab_encode_text_service)}
+  - set_remap: {from: hydra/tracking/open_vocab/encode_image, to: $(var tracking_open_vocab_encode_image_service)}
+  - include:
+      file: $(find-pkg-share hydra_ros)/launch/hydra.launch.yaml
+      arg:
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: dataset, value: hm3d}
+        - {name: labelspace, value: $(var labelspace)}
+        - {name: log_name, value: $(var log_name)}
+        - {name: hydra_config_path, value: $(var hydra_config_base)}
+        - {name: hydra_overlay_config_path, value: $(if $(var use_instance_tracking) $(var trackgraph_common_config) $(var hydra_config_empty))}
+        - {name: input_config_path, value: $(if $(var use_instance_tracking) $(var input_config_tracked) $(var input_config_base))}
+        - {name: input_overlay_config_path, value: $(var input_config_empty)}
+        - {name: visualizer_config_path, value: $(if $(var use_instance_tracking) $(var visualizer_config_tracked) $(var visualizer_config_default))}
+        - {name: visualizer_plugins_path, value: $(if $(var use_instance_tracking) $(var visualizer_plugins_tracked) $(var visualizer_plugins_default))}
+        - {name: start_visualizer, value: $(var start_visualizer)}
+        - {name: visualizer_frame, value: hm3d_viz}
+        - {name: rviz_path, value: $(var rviz_hm3d)}
+        - {name: sensor_frame, value: left_cam}
+        - {name: robot_frame, value: base_link_gt}
+        - {name: odom_frame, value: world}
+        - {name: map_frame, value: map}
+        - {name: lcd_config_path, value: $(find-pkg-share hydra)/config/lcd/default.yaml}
+        - {name: extra_yaml_runtime, value: $(var hydra_extra_yaml_runtime)}
+  - node:
+      pkg: tf2_ros
+      name: world_to_map
+      exec: static_transform_publisher
+      args: --frame-id world --child-frame-id map
+  - node:
+      if: $(var start_visualizer)
+      pkg: tf2_ros
+      name: hm3d_viz_to_world
+      exec: static_transform_publisher
+      args: --x 0 --y 0 --z 0 --roll 1.5707963267948966 --pitch 0 --yaw 0 --frame-id hm3d_viz --child-frame-id world

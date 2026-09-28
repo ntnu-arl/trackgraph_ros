@@ -1,0 +1,20 @@
+# TrackGraph-supported uHumans2 ROS input preset.
+#
+# This preserves the standard uHumans2 camera model while directly selecting
+# TrackGraph's tracked receiver and delayed OpenVocab feature input.
+---
+input:
+  type: RosInput
+  tf_verbosity: 1
+  clear_queue_on_fail: true
+  inputs:
+    left_cam:
+      receiver: {type: TrackedImageReceiver, queue_size: 50}
+      sensor: {type: camera_info, min_range: 0.05, max_range: 6.0, extrinsics: {type: ros, robot_frame: base_link_gt}}
+features: {type: FeatureReceiver}
+open_vocab_features:
+  type: OpenVocabFeatureReceiver
+  enabled: true
+  topic: tracking/open_vocab_features
+  queue_size: 10
+  verbosity: 0
